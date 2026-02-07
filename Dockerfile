@@ -35,7 +35,7 @@ RUN npx prisma generate
 COPY . .
 
 # Expose port (if needed, though Telegram bots often pull updates via long polling)
-# EXPOSE 3000
+
 
 # Start command
 CMD [ "node", "index.js" ]
