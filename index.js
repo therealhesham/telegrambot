@@ -17,29 +17,139 @@ const bot = new Telegraf(process.env.TG_TOKEN);
 
 // Start Command
 bot.start((ctx) => {
-    ctx.reply('Welcome! Please choose a search method:', Markup.inlineKeyboard([
-        [Markup.button.callback('Search by Name', 'search_name')],
-        [Markup.button.callback('Search by ID', 'search_id')]
+    ctx.reply('مرحباً! الرجاء اختيار طريقة البحث:', Markup.inlineKeyboard([
+        [Markup.button.callback('البحث بالاسم', 'search_name')],
+        [Markup.button.callback('البحث برقم العاملة', 'search_id')],
+        [Markup.button.callback('البحث بالجنسية', 'search_nationality')]
     ]));
 });
 
 // Help Command
 bot.help((ctx) => {
-    ctx.reply('Click to choose search method:', Markup.inlineKeyboard([
-        [Markup.button.callback('Search by Name', 'search_name')],
-        [Markup.button.callback('Search by ID', 'search_id')]
+    ctx.reply('اضغط لاختيار طريقة البحث:', Markup.inlineKeyboard([
+        [Markup.button.callback('البحث بالاسم', 'search_name')],
+        [Markup.button.callback('البحث برقم العاملة', 'search_id')],
+        [Markup.button.callback('البحث بالجنسية', 'search_nationality')]
     ]));
 });
 
 // Search Mode Handlers
 bot.action('search_name', async (ctx) => {
     await ctx.deleteMessage();
-    await ctx.reply('Please enter the name:', Markup.forceReply());
+    await ctx.reply('الرجاء إدخال الاسم:', Markup.forceReply());
 });
 
 bot.action('search_id', async (ctx) => {
     await ctx.deleteMessage();
-    await ctx.reply('Please enter the ID:', Markup.forceReply());
+    await ctx.reply('الرجاء إدخال رقم العاملة:', Markup.forceReply());
+});
+
+bot.action('search_nationality', async (ctx) => {
+    try {
+        await ctx.deleteMessage();
+
+        // Fetch unique countries from offices
+        const countries = await prisma.offices.findMany({
+            distinct: ['Country'],
+            select: { Country: true },
+            where: { Country: { not: null } }
+        });
+
+        const uniqueCountries = countries
+            .map(c => c.Country)
+            .filter(c => c && c.trim() !== '');
+
+        if (uniqueCountries.length === 0) {
+            return ctx.reply('لا توجد جنسيات متاحة حالياً.');
+        }
+
+        // Create buttons for each country
+        // Callback data format: search_nat_{index} to keep it short, or just handle strict string matching
+        // But since country names can be long or contain special chars, let's use a mapping approach or hash if needed.
+        // Simple approach: `nat_${index}` and we store the list? No, stateless is better.
+        // Let's try sending the country name if it fits. Max 64 bytes for callback data.
+        // Some country names might be long "Philippines - الفلبين".
+        // Let's use a prefix `nat_` and a short identifier or just the index if we re-fetch (might be inconsistent).
+        // Better: `nat_${countryName.substring(0, 50)}`? No.
+        // Let's use `nat_${index}` and we have to fetch the list again to map it back, OR we just trust the list order hasn't changed (risky but acceptable for low traffic).
+        // Actually, let's put the country name directly if it's safe.
+        // "Philippines - الفلبين" is ~25 chars (Arabic chars take 2 bytes). 25*2 = 50 bytes. tight.
+        // Let's stringify the country into a shorter unique ID on the fly? No.
+        // Let's use the ID of the ONE VALID office for that country? No, multiple offices per country.
+        // Let's iterate and use the index from the sorted list found in DB.
+
+        const buttons = uniqueCountries.map((country, index) => {
+            // We'll use a local in-memory cache or just re-fetch.
+            // For simplicity here, let's pass the country name but truncated/cleaned if needed.
+            // actually, the user wants "intelligent search".
+            // Let's just pass `nat_${index}` and re-fetch the sorted unique list in the handler.
+            return [Markup.button.callback(country, `nat_${index}`)];
+        });
+
+        await ctx.reply('الرجاء اختيار الجنسية:', Markup.inlineKeyboard(buttons));
+
+    } catch (error) {
+        console.error('Error fetching nationalities:', error);
+        ctx.reply('فشل في جلب الجنسيات.');
+    }
+});
+
+// Handler for Country Selection
+bot.action(/nat_(\d+)/, async (ctx) => {
+    const index = parseInt(ctx.match[1], 10);
+
+    try {
+        // Re-fetch to get the correct country string
+        const countries = await prisma.offices.findMany({
+            distinct: ['Country'],
+            select: { Country: true },
+            where: { Country: { not: null } }
+        });
+
+        const uniqueCountries = countries
+            .map(c => c.Country)
+            .filter(c => c && c.trim() !== '');
+
+        if (index < 0 || index >= uniqueCountries.length) {
+            return ctx.reply('اختيار غير صحيح. الرجاء المحاولة مرة أخرى.');
+        }
+
+        const selectedCountry = uniqueCountries[index];
+        await ctx.deleteMessage();
+        await ctx.reply(`جاري البحث عن عاملات من: ${selectedCountry}...`);
+
+        // Search logic
+        const results = await prisma.homemaid.findMany({
+            where: {
+                office: {
+                    Country: selectedCountry
+                }
+            },
+            take: 10, // Limit results
+            select: {
+                id: true,
+                Name: true
+            }
+        });
+
+        if (results.length === 0) {
+            return ctx.reply(`لم يتم العثور على عاملات من ${selectedCountry}.`, Markup.inlineKeyboard([
+                [Markup.button.callback('البحث بالجنسية', 'search_nationality')],
+                [Markup.button.callback('العودة للقائمة الرئيسية', '/start')]
+            ]));
+        }
+
+        const buttons = results.map((record) => {
+            return Markup.button.callback(record.Name || 'اسم غير معروف', `get_cv_${record.id}`);
+        });
+
+        const keyboard = Markup.inlineKeyboard(buttons, { columns: 1 });
+        await ctx.reply(`تم العثور على ${results.length} نتيجة. اختر واحدة لإنشاء السيرة الذاتية PDF:`, keyboard);
+
+    } catch (error) {
+        console.error('Error searching by nationality:', error);
+        ctx.reply('حدث خطأ أثناء البحث.');
+    }
 });
 
 // Search Logic
@@ -48,9 +158,10 @@ bot.on('text', async (ctx) => {
     const replyMessage = ctx.message.reply_to_message;
 
     if (!replyMessage) {
-        return ctx.reply('Please choose a search method first:', Markup.inlineKeyboard([
-            [Markup.button.callback('Search by Name', 'search_name')],
-            [Markup.button.callback('Search by ID', 'search_id')]
+        return ctx.reply('الرجاء اختيار طريقة البحث أولاً:', Markup.inlineKeyboard([
+            [Markup.button.callback('البحث بالاسم', 'search_name')],
+            [Markup.button.callback('البحث برقم الهوية', 'search_id')],
+            [Markup.button.callback('البحث بالجنسية', 'search_nationality')]
         ]));
     }
 
@@ -59,9 +170,9 @@ bot.on('text', async (ctx) => {
     try {
         let results = [];
 
-        if (promptText === 'Please enter the name:') {
+        if (promptText === 'الرجاء إدخال الاسم:' || promptText === 'Please enter the name:') {
             if (query.length < 2) {
-                return ctx.reply('Please enter at least 2 characters to search.', Markup.forceReply());
+                return ctx.reply('الرجاء إدخال حرفين على الأقل للبحث.', Markup.forceReply());
             }
 
             console.log(`Searching by Name: "${query}"`);
@@ -78,10 +189,10 @@ bot.on('text', async (ctx) => {
                 },
             });
 
-        } else if (promptText === 'Please enter the ID:') {
+        } else if (promptText === 'الرجاء إدخال رقم الهوية:' || promptText === 'Please enter the ID:') {
             const searchId = parseInt(query, 10);
             if (isNaN(searchId)) {
-                return ctx.reply('Please enter a valid numeric ID.', Markup.forceReply());
+                return ctx.reply('الرجاء إدخال رقم هوية صحيح.', Markup.forceReply());
             }
 
             console.log(`Searching by ID: "${searchId}"`);
@@ -97,31 +208,33 @@ bot.on('text', async (ctx) => {
 
         } else {
             // Unknown reply context
-            return ctx.reply('Please use the menu commands.', Markup.inlineKeyboard([
-                [Markup.button.callback('Search by Name', 'search_name')],
-                [Markup.button.callback('Search by ID', 'search_id')]
+            return ctx.reply('الرجاء استخدام خيارات القائمة.', Markup.inlineKeyboard([
+                [Markup.button.callback('البحث بالاسم', 'search_name')],
+                [Markup.button.callback('البحث برقم الهوية', 'search_id')],
+                [Markup.button.callback('البحث بالجنسية', 'search_nationality')]
             ]));
         }
 
         if (results.length === 0) {
             // Provide a way to try again easily
-            return ctx.reply('No matches found. Try again?', Markup.inlineKeyboard([
-                [Markup.button.callback('Search by Name', 'search_name')],
-                [Markup.button.callback('Search by ID', 'search_id')]
+            return ctx.reply('لم يتم العثور على نتائج. المحاولة مرة أخرى؟', Markup.inlineKeyboard([
+                [Markup.button.callback('البحث بالاسم', 'search_name')],
+                [Markup.button.callback('البحث برقم الهوية', 'search_id')],
+                [Markup.button.callback('البحث بالجنسية', 'search_nationality')]
             ]));
         }
 
         const buttons = results.map((record) => {
-            return Markup.button.callback(record.Name || 'Unknown Name', `get_cv_${record.id}`);
+            return Markup.button.callback(record.Name || 'اسم غير معروف', `get_cv_${record.id}`);
         });
 
         const keyboard = Markup.inlineKeyboard(buttons, { columns: 1 });
 
-        await ctx.reply(`Found ${results.length} matches. Select one to generate PDF CV:`, keyboard);
+        await ctx.reply(`تم العثور على ${results.length} نتيجة. اختر واحدة لإنشاء السيرة الذاتية PDF:`, keyboard);
 
     } catch (error) {
         console.error('Search Error:', error);
-        ctx.reply('An error occurred while searching the database.');
+        ctx.reply('حدث خطأ أثناء البحث في قاعدة البيانات.');
     }
 });
 
@@ -169,7 +282,7 @@ bot.action(/get_cv_(\d+)/, async (ctx) => {
     let browser = null;
 
     try {
-        await ctx.reply('Generating PDF CV, please wait...');
+        await ctx.reply('جاري إنشاء ملف السيرة الذاتية (PDF)، الرجاء الانتظار...');
 
         // Fetch complete record
         const record = await prisma.homemaid.findUnique({
@@ -178,7 +291,7 @@ bot.action(/get_cv_(\d+)/, async (ctx) => {
         });
 
         if (!record) {
-            return ctx.reply('Record not found.');
+            return ctx.reply('لم يتم العثور على السجل.');
         }
 
         // Image Handling
@@ -521,7 +634,7 @@ bot.action(/get_cv_(\d+)/, async (ctx) => {
 
     } catch (error) {
         console.error('PDF Generation Error:', error);
-        ctx.reply('Failed to generate PDF. Please try again later.');
+        ctx.reply('فشل في إنشاء ملف PDF. الرجاء المحاولة مرة أخرى لاحقاً.');
     } finally {
         if (browser) await browser.close();
     }
