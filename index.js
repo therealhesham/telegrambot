@@ -89,28 +89,33 @@ const renderResults = async (ctx, userId, edit = false) => {
         if (filters.religion === 'Muslim') {
             where.OR = [
                 { Religion: { contains: 'Muslim' } },
-                { Religion: { contains: 'Islam' } },
+                { Religion: { contains: 'Islam - الإسلام' } },
                 { Religion: { contains: 'مسلم' } },
                 { Religion: { contains: 'اسلام' } }
             ];
         } else if (filters.religion === 'Non-Muslim') {
             where.NOT = [
                 { Religion: { contains: 'Muslim' } },
-                { Religion: { contains: 'Islam' } },
+                { Religion: { contains: 'Non-Muslim - غير مسلم' } },
                 { Religion: { contains: 'مسلم' } },
                 { Religion: { contains: 'اسلام' } }
             ];
         }
     }
-
+    const maritalStatusOptions = [
+        "Single - عازبة",
+        "Married - متزوجة",
+        "Divorced - مطلقة",
+        "Widowed - أرملة"
+    ];
     if (filters.maritalStatus) {
         // Simple string match for now, can be improved with OR for Arabic/English
         // Expecting filters.maritalStatus to be a key like 'Single', 'Married'
         const statusMap = {
-            'Single': ['Single', 'عزباء', 'Unmarried'],
-            'Married': ['Married', 'متزوجة'],
-            'Divorced': ['Divorced', 'مطلقة'],
-            'Widowed': ['Widowed', 'أرملة']
+            'Single': ['Single', 'عزباء', 'Unmarried', 'Single - عازبة'],
+            'Married': ['Married', 'متزوجة', 'Married - متزوجة'],
+            'Divorced': ['Divorced', 'مطلقة', 'Divorced - مطلقة'],
+            'Widowed': ['Widowed', 'أرملة', 'Widowed - أرملة']
         };
         const terms = statusMap[filters.maritalStatus] || [filters.maritalStatus];
         where.OR = (where.OR || []).concat(terms.map(t => ({ maritalstatus: { contains: t } })));
