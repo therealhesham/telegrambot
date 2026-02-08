@@ -153,7 +153,7 @@ const renderResults = async (ctx, userId, edit = false) => {
                 where,
                 skip: page * PAGE_SIZE,
                 take: PAGE_SIZE,
-                select: { id: true, Name: true, age: true, Religion: true, maritalstatus: true }
+                select: { id: true, Name: true, dateofbirth: true, Religion: true, maritalstatus: true, Salary: true, Experience: true }
             })
         ]);
 
@@ -167,8 +167,29 @@ const renderResults = async (ctx, userId, edit = false) => {
             return ctx.reply(text, Markup.inlineKeyboard(buttons));
         }
 
-        // Build Buttons
-        const buttons = maids.map(m => [Markup.button.callback(m.Name || 'اسم غير معروف', `get_cv_${m.id}`)]);
+        // Build Buttons with Enhanced Details
+        const buttons = maids.map(m => {
+            const age = calculateAge(m.dateofbirth) || 'غير متوفر';
+            // Clean up Religion and Status (remove English part if mixed, or just take first part)
+            // Example: "Muslim - مسلم" -> "مسلم"
+            // Let's try to extract Arabic or fallback to full string
+            const clean = (str) => {
+                if (!str) return '-';
+                const parts = str.split('-');
+                return parts.length > 1 ? parts[1].trim() : str;
+            };
+            const religion = clean(m.Religion);
+            const status = clean(m.maritalstatus);
+
+            // Format: "Name | Age سنة | Religion | Status"
+            // Telegram button text limit is ~64 chars. We need to be concise.
+            // Let's truncate name if too long.
+            let name = m.Name || 'اسم غير معروف';
+            if (name.length > 15) name = name.substring(0, 15) + '..';
+
+            const label = `${name} | ${age} سنة | ${religion} | ${status}`;
+            return [Markup.button.callback(label, `get_cv_${m.id}`)];
+        });
 
         // Pagination Buttons
         const paginationButtons = [];
