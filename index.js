@@ -44,9 +44,156 @@ bot.action('search_id', async (ctx) => {
     await ctx.reply('الرجاء إدخال رقم العاملة:', Markup.forceReply());
 });
 
+
+// Session Store (In-memory)
+const userSessions = new Map();
+
+// Helper: Get Session
+const getSession = (userId) => {
+    if (!userSessions.has(userId)) {
+        userSessions.set(userId, {
+            nationality: null,
+            filters: {
+                religion: null, // 'Muslim', 'Non-Muslim', or null (All)
+                age: null,     // '20-30', '30-40', '40-50', '50+', or null (All)
+                maritalStatus: null // 'Single', 'Married', 'Divorced', 'Widowed', or null (All)
+            },
+            page: 0
+        });
+    }
+    return userSessions.get(userId);
+};
+
+// Helper: Reset Session
+const resetSession = (userId) => {
+    userSessions.delete(userId);
+};
+
+// Constant: Page Size
+const PAGE_SIZE = 5;
+
+// Helper: Render Results
+const renderResults = async (ctx, userId, edit = false) => {
+    const session = getSession(userId);
+    if (!session.nationality) return ctx.reply('الرجاء اختيار الجنسية أولاً.');
+
+    const { nationality, filters, page } = session;
+
+    // Build Query
+    const where = {
+        office: { Country: nationality }
+    };
+
+    // Apply Filters
+    if (filters.religion) {
+        if (filters.religion === 'Muslim') {
+            where.OR = [
+                { Religion: { contains: 'Muslim' } },
+                { Religion: { contains: 'Islam' } },
+                { Religion: { contains: 'مسلم' } },
+                { Religion: { contains: 'اسلام' } }
+            ];
+        } else if (filters.religion === 'Non-Muslim') {
+            where.NOT = [
+                { Religion: { contains: 'Muslim' } },
+                { Religion: { contains: 'Islam' } },
+                { Religion: { contains: 'مسلم' } },
+                { Religion: { contains: 'اسلام' } }
+            ];
+        }
+    }
+
+    if (filters.maritalStatus) {
+        // Simple string match for now, can be improved with OR for Arabic/English
+        // Expecting filters.maritalStatus to be a key like 'Single', 'Married'
+        const statusMap = {
+            'Single': ['Single', 'عزباء', 'Unmarried'],
+            'Married': ['Married', 'متزوجة'],
+            'Divorced': ['Divorced', 'مطلقة'],
+            'Widowed': ['Widowed', 'أرملة']
+        };
+        const terms = statusMap[filters.maritalStatus] || [filters.maritalStatus];
+        where.OR = (where.OR || []).concat(terms.map(t => ({ maritalstatus: { contains: t } })));
+    }
+
+    if (filters.age) {
+        const today = new Date();
+        const currentYear = today.getFullYear();
+        let minAge, maxAge;
+
+        switch (filters.age) {
+            case '20-30': minAge = 20; maxAge = 30; break;
+            case '30-40': minAge = 30; maxAge = 40; break;
+            case '40-50': minAge = 40; maxAge = 50; break;
+            case '50+': minAge = 50; maxAge = 100; break;
+        }
+
+        if (minAge) {
+            const minDate = new Date(today);
+            minDate.setFullYear(currentYear - maxAge);
+            const maxDate = new Date(today);
+            maxDate.setFullYear(currentYear - minAge);
+
+            where.dateofbirth = {
+                gte: minDate,
+                lte: maxDate
+            };
+        }
+    }
+
+    try {
+        const [total, maids] = await prisma.$transaction([
+            prisma.homemaid.count({ where }),
+            prisma.homemaid.findMany({
+                where,
+                skip: page * PAGE_SIZE,
+                take: PAGE_SIZE,
+                select: { id: true, Name: true, age: true, Religion: true, maritalstatus: true }
+            })
+        ]);
+
+        if (total === 0) {
+            const text = `لم يتم العثور على عاملات من ${nationality} بالمواصفات المحددة.`;
+            const buttons = [
+                [Markup.button.callback('تغيير الفلاتر ⚙️', 'open_filters')],
+                [Markup.button.callback('العودة للقائمة', 'search_nationality')]
+            ];
+            if (edit) return ctx.editMessageText(text, Markup.inlineKeyboard(buttons));
+            return ctx.reply(text, Markup.inlineKeyboard(buttons));
+        }
+
+        // Build Buttons
+        const buttons = maids.map(m => [Markup.button.callback(m.Name || 'اسم غير معروف', `get_cv_${m.id}`)]);
+
+        // Pagination Buttons
+        const paginationButtons = [];
+        if (page > 0) paginationButtons.push(Markup.button.callback('⬅️ السابق', 'prev_page'));
+        if ((page + 1) * PAGE_SIZE < total) paginationButtons.push(Markup.button.callback('التالي ➡️', 'next_page'));
+
+        if (paginationButtons.length > 0) buttons.push(paginationButtons);
+
+        // Filter & Menu Buttons
+        buttons.push([Markup.button.callback('تخصيص البحث (فلاتر) ⚙️', 'open_filters')]);
+        buttons.push([Markup.button.callback('بحث جديد', 'search_nationality')]);
+
+        const text = `نتائج البحث (${nationality})\nالصفحة ${page + 1} من ${Math.ceil(total / PAGE_SIZE)}\nالعدد الكلي: ${total}`;
+
+        if (edit) {
+            await ctx.editMessageText(text, Markup.inlineKeyboard(buttons));
+        } else {
+            await ctx.reply(text, Markup.inlineKeyboard(buttons));
+        }
+
+    } catch (error) {
+        console.error('Error rendering results:', error);
+        ctx.reply('حدث خطأ أثناء عرض النتائج.');
+    }
+};
+
 bot.action('search_nationality', async (ctx) => {
     try {
         await ctx.deleteMessage();
+        resetSession(ctx.from.id); // Reset previous session
 
         // Fetch unique countries from offices
         const countries = await prisma.offices.findMany({
@@ -63,26 +210,7 @@ bot.action('search_nationality', async (ctx) => {
             return ctx.reply('لا توجد جنسيات متاحة حالياً.');
         }
 
-        // Create buttons for each country
-        // Callback data format: search_nat_{index} to keep it short, or just handle strict string matching
-        // But since country names can be long or contain special chars, let's use a mapping approach or hash if needed.
-        // Simple approach: `nat_${index}` and we store the list? No, stateless is better.
-        // Let's try sending the country name if it fits. Max 64 bytes for callback data.
-        // Some country names might be long "Philippines - الفلبين".
-        // Let's use a prefix `nat_` and a short identifier or just the index if we re-fetch (might be inconsistent).
-        // Better: `nat_${countryName.substring(0, 50)}`? No.
-        // Let's use `nat_${index}` and we have to fetch the list again to map it back, OR we just trust the list order hasn't changed (risky but acceptable for low traffic).
-        // Actually, let's put the country name directly if it's safe.
-        // "Philippines - الفلبين" is ~25 chars (Arabic chars take 2 bytes). 25*2 = 50 bytes. tight.
-        // Let's stringify the country into a shorter unique ID on the fly? No.
-        // Let's use the ID of the ONE VALID office for that country? No, multiple offices per country.
-        // Let's iterate and use the index from the sorted list found in DB.
-
         const buttons = uniqueCountries.map((country, index) => {
-            // We'll use a local in-memory cache or just re-fetch.
-            // For simplicity here, let's pass the country name but truncated/cleaned if needed.
-            // actually, the user wants "intelligent search".
-            // Let's just pass `nat_${index}` and re-fetch the sorted unique list in the handler.
             return [Markup.button.callback(country, `nat_${index}`)];
         });
 
@@ -99,7 +227,6 @@ bot.action(/nat_(\d+)/, async (ctx) => {
     const index = parseInt(ctx.match[1], 10);
 
     try {
-        // Re-fetch to get the correct country string
         const countries = await prisma.offices.findMany({
             distinct: ['Country'],
             select: { Country: true },
@@ -116,41 +243,125 @@ bot.action(/nat_(\d+)/, async (ctx) => {
 
         const selectedCountry = uniqueCountries[index];
         await ctx.deleteMessage();
-        await ctx.reply(`جاري البحث عن عاملات من: ${selectedCountry}...`);
 
-        // Search logic
-        const results = await prisma.homemaid.findMany({
-            where: {
-                office: {
-                    Country: selectedCountry
-                }
-            },
-            take: 10, // Limit results
-            select: {
-                id: true,
-                Name: true
-            }
-        });
+        // Initialize Session
+        const session = getSession(ctx.from.id);
+        session.nationality = selectedCountry;
+        session.page = 0;
 
-        if (results.length === 0) {
-            return ctx.reply(`لم يتم العثور على عاملات من ${selectedCountry}.`, Markup.inlineKeyboard([
-                [Markup.button.callback('البحث بالجنسية', 'search_nationality')],
-                [Markup.button.callback('العودة للقائمة الرئيسية', '/start')]
-            ]));
-        }
-
-        const buttons = results.map((record) => {
-            return Markup.button.callback(record.Name || 'اسم غير معروف', `get_cv_${record.id}`);
-        });
-
-        const keyboard = Markup.inlineKeyboard(buttons, { columns: 1 });
-        await ctx.reply(`تم العثور على ${results.length} نتيجة. اختر واحدة لإنشاء السيرة الذاتية PDF:`, keyboard);
+        await renderResults(ctx, ctx.from.id);
 
     } catch (error) {
         console.error('Error searching by nationality:', error);
         ctx.reply('حدث خطأ أثناء البحث.');
     }
 });
+
+// Pagination Handlers
+bot.action('next_page', async (ctx) => {
+    const session = getSession(ctx.from.id);
+    if (!session.nationality) return ctx.reply('جلسة منتهية. ابدأ البحث من جديد.');
+    session.page++;
+    await renderResults(ctx, ctx.from.id, true);
+});
+
+bot.action('prev_page', async (ctx) => {
+    const session = getSession(ctx.from.id);
+    if (!session.nationality) return ctx.reply('جلسة منتهية. ابدأ البحث من جديد.');
+    if (session.page > 0) session.page--;
+    await renderResults(ctx, ctx.from.id, true);
+});
+
+// Filter Menu
+bot.action('open_filters', async (ctx) => {
+    const session = getSession(ctx.from.id);
+    if (!session.nationality) return ctx.reply('جلسة منتهية. ابدأ البحث من جديد.');
+
+    const { filters } = session;
+
+    const text = `تخصيص البحث\n` +
+        `الديانة: ${filters.religion || 'الكل'}\n` +
+        `العمر: ${filters.age || 'الكل'}\n` +
+        `الحالة الاجتماعية: ${filters.maritalStatus || 'الكل'}`;
+
+    const buttons = [
+        [Markup.button.callback(`الديانة: ${filters.religion || 'الكل'}`, 'toggle_religion')],
+        [Markup.button.callback(`العمر: ${filters.age || 'الكل'}`, 'toggle_age')],
+        [Markup.button.callback(`الحالة الاجتماعية: ${filters.maritalStatus || 'الكل'}`, 'toggle_status')],
+        [Markup.button.callback('✅ تطبيق الفلاتر', 'apply_filters')],
+    ];
+
+    await ctx.editMessageText(text, Markup.inlineKeyboard(buttons));
+});
+
+// Toggle Handlers
+bot.action('toggle_religion', async (ctx) => {
+    const session = getSession(ctx.from.id);
+    const current = session.filters.religion;
+    // Cycle: null -> Muslim -> Non-Muslim -> null
+    if (!current) session.filters.religion = 'Muslim';
+    else if (current === 'Muslim') session.filters.religion = 'Non-Muslim';
+    else session.filters.religion = null;
+
+    // Refresh menu
+    await renderFilterMenu(ctx);
+});
+
+bot.action('toggle_age', async (ctx) => {
+    const session = getSession(ctx.from.id);
+    const ranges = [null, '20-30', '30-40', '40-50', '50+'];
+    const currentIndex = ranges.indexOf(session.filters.age);
+    const nextIndex = (currentIndex + 1) % ranges.length;
+    session.filters.age = ranges[nextIndex];
+    await renderFilterMenu(ctx);
+});
+
+bot.action('toggle_status', async (ctx) => {
+    const session = getSession(ctx.from.id);
+    const statuses = [null, 'Single', 'Married', 'Divorced', 'Widowed'];
+    const currentIndex = statuses.indexOf(session.filters.maritalStatus);
+    const nextIndex = (currentIndex + 1) % statuses.length;
+    session.filters.maritalStatus = statuses[nextIndex];
+    await renderFilterMenu(ctx);
+});
+
+const renderFilterMenu = async (ctx) => {
+    const session = getSession(ctx.from.id);
+    const { filters } = session;
+
+    // Translate for display
+    const relDisplay = filters.religion === 'Muslim' ? 'مسلمة' : (filters.religion === 'Non-Muslim' ? 'غير مسلمة' : 'الكل');
+    const statusDisplayMap = {
+        'Single': 'عزباء', 'Married': 'متزوجة', 'Divorced': 'مطلقة', 'Widowed': 'أرملة', null: 'الكل'
+    };
+    const statusDisplay = statusDisplayMap[filters.maritalStatus] || 'الكل';
+
+    const text = `تخصيص البحث\n` +
+        `الديانة: ${relDisplay}\n` +
+        `العمر: ${filters.age || 'الكل'}\n` +
+        `الحالة الاجتماعية: ${statusDisplay}`;
+
+    const buttons = [
+        [Markup.button.callback(`الديانة: ${relDisplay}`, 'toggle_religion')],
+        [Markup.button.callback(`العمر: ${filters.age || 'الكل'}`, 'toggle_age')],
+        [Markup.button.callback(`الحالة الاجتماعية: ${statusDisplay}`, 'toggle_status')],
+        [Markup.button.callback('✅ تطبيق الفلاتر', 'apply_filters')],
+    ];
+
+    try {
+        await ctx.editMessageText(text, Markup.inlineKeyboard(buttons));
+    } catch (e) {
+        // Ignored (msg not modified)
+    }
+};
+
+bot.action('apply_filters', async (ctx) => {
+    // Reset page to 0 when applying filters
+    const session = getSession(ctx.from.id);
+    session.page = 0;
+    await renderResults(ctx, ctx.from.id, true);
+});
+
 
 // Search Logic
 bot.on('text', async (ctx) => {
